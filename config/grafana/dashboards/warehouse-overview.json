@@ -1,0 +1,18 @@
+{
+  "uid": "warehouse-overview",
+  "title": "Warehouse HA Overview",
+  "schemaVersion": 41,
+  "refresh": "5s",
+  "time": {"from": "now-30m", "to": "now"},
+  "panels": [
+    {"id":1,"type":"stat","title":"Healthy nodes","gridPos":{"x":0,"y":0,"w":4,"h":4},"targets":[{"expr":"sum(up{job=\"warehouse\"})","refId":"A"}]},
+    {"id":2,"type":"stat","title":"Quorum","gridPos":{"x":4,"y":0,"w":4,"h":4},"targets":[{"expr":"max(warehouse_quorum_available)","refId":"A"}]},
+    {"id":3,"type":"stat","title":"Active writers","gridPos":{"x":8,"y":0,"w":4,"h":4},"targets":[{"expr":"sum(warehouse_writer_lease_owned)","refId":"A"}]},
+    {"id":4,"type":"stat","title":"Writer epoch","gridPos":{"x":12,"y":0,"w":4,"h":4},"targets":[{"expr":"max(warehouse_writer_epoch)","refId":"A"}]},
+    {"id":5,"type":"stat","title":"Replication lag","gridPos":{"x":16,"y":0,"w":4,"h":4},"targets":[{"expr":"max(warehouse_replication_lag)","refId":"A"}]},
+    {"id":6,"type":"stat","title":"DLQ / conflicts","gridPos":{"x":20,"y":0,"w":4,"h":4},"targets":[{"expr":"sum(warehouse_conflicts_total)","refId":"A"}]},
+    {"id":7,"type":"timeseries","title":"Operations rate","gridPos":{"x":0,"y":4,"w":12,"h":8},"targets":[{"expr":"sum(rate(warehouse_operations_applied_total[1m]))","legendFormat":"applied/s","refId":"A"},{"expr":"sum(rate(warehouse_operations_duplicate_total[1m]))","legendFormat":"duplicates/s","refId":"B"}]},
+    {"id":8,"type":"timeseries","title":"Memory and local storage","gridPos":{"x":12,"y":4,"w":12,"h":8},"targets":[{"expr":"warehouse_process_memory_bytes","legendFormat":"RSS {{instance}}","refId":"A"},{"expr":"warehouse_disk_dedup_bytes","legendFormat":"dedup {{instance}}","refId":"B"},{"expr":"warehouse_wal_bytes","legendFormat":"WAL {{instance}}","refId":"C"}]},
+    {"id":9,"type":"timeseries","title":"Replicated sequence and checkpoint","gridPos":{"x":0,"y":12,"w":24,"h":8},"targets":[{"expr":"warehouse_replication_last_sequence","legendFormat":"stream {{instance}}","refId":"A"},{"expr":"warehouse_replication_checkpoint","legendFormat":"checkpoint {{instance}}","refId":"B"}]}
+  ]
+}

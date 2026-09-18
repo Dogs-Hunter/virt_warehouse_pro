@@ -1,0 +1,7 @@
+services:
+  warehouse:
+    environment:
+      WAREHOUSE_STREAM_MAX_BYTES: "1048576"
+  warehouse-2:
+    environment:
+      WAREHOUSE_STREAM_MAX_BYTES: "1048576"

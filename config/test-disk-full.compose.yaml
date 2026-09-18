@@ -1,0 +1,10 @@
+services:
+  warehouse:
+    volumes: !override
+      - type: tmpfs
+        target: /data
+        tmpfs:
+          size: 67108864
+          # Compose expects the numeric permission bits in decimal: 01777 = 1023.
+          mode: 1023
+      - ./config/tls:/etc/warehouse/tls:ro

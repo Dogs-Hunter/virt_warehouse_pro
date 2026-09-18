@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 2s
+  evaluation_interval: 2s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: warehouse
+    metrics_path: /metrics
+    static_configs:
+      - targets: [warehouse:8080, warehouse-2:8080]

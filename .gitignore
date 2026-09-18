@@ -1,0 +1,21 @@
+# Generated benchmark data (large and reproducible)
+benchmark-data/
+
+# Development TLS keys and certificates; regenerate locally
+config/tls/*
+!config/tls/.gitkeep
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Rust and editor artifacts
+target/
+*.pdb
+.idea/
+.vscode/
+
+# OS artifacts
+Thumbs.db
+.DS_Store

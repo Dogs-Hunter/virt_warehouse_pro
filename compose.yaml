@@ -1,0 +1,198 @@
+services:
+  nats-1:
+    image: nats:2.11-alpine
+    command: ["-c", "/etc/nats/nats.conf"]
+    volumes:
+      - ./config/nats/nats-1.conf:/etc/nats/nats.conf:ro
+      - ./config/tls:/etc/nats/tls:ro
+      - nats-1-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+
+  nats-2:
+    image: nats:2.11-alpine
+    command: ["-c", "/etc/nats/nats.conf"]
+    volumes:
+      - ./config/nats/nats-2.conf:/etc/nats/nats.conf:ro
+      - ./config/tls:/etc/nats/tls:ro
+      - nats-2-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+
+  nats-3:
+    image: nats:2.11-alpine
+    command: ["-c", "/etc/nats/nats.conf"]
+    volumes:
+      - ./config/nats/nats-3.conf:/etc/nats/nats.conf:ro
+      - ./config/tls:/etc/nats/tls:ro
+      - nats-3-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+
+  warehouse:
+    image: test-warehouse:latest
+    build: .
+    environment:
+      WAREHOUSE_BIND: 0.0.0.0:8080
+      WAREHOUSE_DATA_DIR: /data
+      WAREHOUSE_SHARDS: 16
+      WAREHOUSE_WAL_BATCH: 1024
+      WAREHOUSE_WAL_FLUSH_MS: 2
+      WAREHOUSE_NATS_URL: tls://nats-1:4222
+      NATS_URL: tls://nats-1:4222
+      WAREHOUSE_NATS_CA: /etc/warehouse/tls/warehouse.crt
+      WAREHOUSE_NATS_USER: warehouse
+      WAREHOUSE_NATS_PASSWORD: warehouse-client-9f4c7a2e
+      WAREHOUSE_STREAM_MAX_BYTES: ${WAREHOUSE_STREAM_MAX_BYTES:-17179869184}
+      WAREHOUSE_LIVE_TAIL: "true"
+      WAREHOUSE_FAIL_AFTER_REPLICATE_ID: ${WAREHOUSE_FAIL_AFTER_REPLICATE_ID:-}
+      WAREHOUSE_INSTANCE_ID: warehouse-1
+      WAREHOUSE_WRITER_PRIORITY_DELAY_MS: 0
+    ports:
+      - "127.0.0.1:8082:8080"
+    volumes:
+      - warehouse-data:/data
+      - ./config/tls:/etc/warehouse/tls:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/live"]
+      interval: 5s
+      timeout: 2s
+      retries: 20
+    depends_on:
+      nats-1:
+        condition: service_healthy
+      nats-2:
+        condition: service_healthy
+      nats-3:
+        condition: service_healthy
+
+  warehouse-2:
+    image: test-warehouse:latest
+    build: .
+    environment:
+      WAREHOUSE_BIND: 0.0.0.0:8080
+      WAREHOUSE_DATA_DIR: /data
+      WAREHOUSE_SHARDS: 16
+      WAREHOUSE_WAL_BATCH: 1024
+      WAREHOUSE_WAL_FLUSH_MS: 2
+      WAREHOUSE_NATS_URL: tls://nats-2:4222
+      NATS_URL: tls://nats-2:4222
+      WAREHOUSE_NATS_CA: /etc/warehouse/tls/warehouse.crt
+      WAREHOUSE_NATS_USER: warehouse
+      WAREHOUSE_NATS_PASSWORD: warehouse-client-9f4c7a2e
+      WAREHOUSE_STREAM_MAX_BYTES: ${WAREHOUSE_STREAM_MAX_BYTES:-17179869184}
+      WAREHOUSE_LIVE_TAIL: "true"
+      WAREHOUSE_INSTANCE_ID: warehouse-2
+      WAREHOUSE_WRITER_PRIORITY_DELAY_MS: 1000
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - warehouse-2-data:/data
+      - ./config/tls:/etc/warehouse/tls:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/live"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+    depends_on:
+      nats-1:
+        condition: service_healthy
+      nats-2:
+        condition: service_healthy
+      nats-3:
+        condition: service_healthy
+
+  haproxy:
+    image: haproxy:3.2.20-alpine
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "8443:8443"
+    environment:
+      WAREHOUSE_API_TOKEN: ${WAREHOUSE_API_TOKEN:-warehouse-api-6d3f9c8a}
+    volumes:
+      - ./config/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./config/tls:/usr/local/etc/haproxy/tls:ro
+    restart: unless-stopped
+    depends_on:
+      warehouse:
+        condition: service_healthy
+      warehouse-2:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.3.4
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-warehouse-grafana-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  loadgen:
+    image: test-warehouse:latest
+    build: .
+    profiles: ["benchmark"]
+    entrypoint: ["warehouse-loadgen"]
+    environment:
+      WAREHOUSE_URL: http://warehouse:8080
+      WAREHOUSE_API_TOKEN: ${WAREHOUSE_API_TOKEN:-warehouse-api-6d3f9c8a}
+      NATS_URL: tls://nats-1:4222
+      WAREHOUSE_NATS_CA: /etc/warehouse/tls/warehouse.crt
+      WAREHOUSE_NATS_USER: warehouse
+      WAREHOUSE_NATS_PASSWORD: warehouse-client-9f4c7a2e
+      LOAD_OPERATIONS: 1000000
+      LOAD_BATCH_SIZE: 1000
+      LOAD_CONCURRENCY: 32
+      LOAD_OWNERS: 10000
+      LOAD_SKUS: 1000
+      LOAD_RUN_ID: baseline-1
+    depends_on:
+      warehouse:
+        condition: service_healthy
+    volumes:
+      - ./config/tls:/etc/warehouse/tls:ro
+
+volumes:
+  warehouse-data:
+  warehouse-2-data:
+  nats-1-data:
+  nats-2-data:
+  nats-3-data:
+  prometheus-data:
+  grafana-data:
