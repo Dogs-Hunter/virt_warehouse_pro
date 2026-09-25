@@ -1,4 +1,5 @@
 param(
+    [switch]$SkipBuild,
     [int]$Operations = 5000000,
     [int]$TimeoutSeconds = 180
 )
@@ -12,8 +13,10 @@ $outputFile = [IO.Path]::GetTempFileName()
 $errorFile = [IO.Path]::GetTempFileName()
 $stoppedService = $null
 
-function Get-JetStreamStatus {
-    foreach ($service in @("nats-1", "nats-2", "nats-3")) {
+function Get-JetStreamStatus([string]$PreferredService = '') {
+    $services = @("nats-1", "nats-2", "nats-3")
+    if ($PreferredService) { $services = @($PreferredService) + @($services | Where-Object { $_ -ne $PreferredService }) }
+    foreach ($service in $services) {
         $container = docker compose ps -q $service
         if ($LASTEXITCODE -ne 0 -or -not $container) {
             continue
@@ -57,9 +60,12 @@ try {
 
     Write-Host "[2/6] Starting $Operations operations"
     $arguments = @(
-        "compose", "--profile", "benchmark", "run", "--rm",
+        "compose", "--profile", "benchmark", "run", "--rm", "--no-deps",
         "-e", "LOAD_RUN_ID=$runId",
         "-e", "LOAD_OPERATIONS=$Operations",
+        "-e", "WAREHOUSE_URL=http://haproxy:8080",
+        "-e", "LOAD_RETRIES=100",
+        "-e", "LOAD_RETRY_MS=50",
         "loadgen"
     )
     $load = Start-Process -FilePath "docker" `
@@ -114,9 +120,10 @@ try {
     if ($load.ExitCode -ne 0) {
         throw "Load generator failed with exit $($load.ExitCode): $stderr"
     }
-    if ($stdout -notmatch "operations=$Operations" -or
-        $stdout -notmatch "applied=$Operations" -or
-        $stdout -notmatch "duplicates=0") {
+    $appliedMatch = [regex]::Match($stdout, '(?m)^applied=(\d+)$')
+    $duplicateMatch = [regex]::Match($stdout, '(?m)^duplicates=(\d+)$')
+    if ($stdout -notmatch "operations=$Operations" -or -not $appliedMatch.Success -or -not $duplicateMatch.Success -or
+        ([int64]$appliedMatch.Groups[1].Value + [int64]$duplicateMatch.Groups[1].Value) -ne $Operations) {
         throw "Unexpected load result"
     }
 
@@ -139,7 +146,11 @@ try {
     while ([DateTime]::UtcNow -lt $catchupDeadline) {
         Start-Sleep -Milliseconds 200
         try {
-            $afterStream = Get-StreamDetail (Get-JetStreamStatus)
+            $candidateStatus = Get-JetStreamStatus
+            $candidateStream = Get-StreamDetail $candidateStatus
+            # Followers may briefly expose a stale replica list after restart.
+            # The stream leader is authoritative for catch-up completion.
+            $afterStream = Get-StreamDetail (Get-JetStreamStatus $candidateStream.cluster.leader)
             $returnedReplica = $afterStream.cluster.replicas |
                 Where-Object { $_.name -eq $leader } |
                 Select-Object -First 1

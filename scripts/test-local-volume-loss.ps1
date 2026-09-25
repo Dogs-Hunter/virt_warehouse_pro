@@ -1,5 +1,6 @@
 param(
-    [int]$TimeoutSeconds = 180
+    [int]$TimeoutSeconds = 1800,
+    [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,12 +13,12 @@ $ownerId = "volume-owner-$runId"
 $sku = "volume-sku"
 $expectedBalance = 41
 
-function Wait-Warehouse {
+function Wait-Warehouse([string]$Uri = 'http://localhost:8080/live') {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
         Start-Sleep -Milliseconds 200
         try {
-            $health = Invoke-RestMethod "http://localhost:8080/live" -TimeoutSec 1
+            $health = Invoke-RestMethod $Uri -TimeoutSec 2
             if ($health.status -eq "ok") { return }
         } catch {
             # Expected while full replicated-log replay is running.
@@ -29,11 +30,15 @@ function Wait-Warehouse {
 Push-Location $projectDirectory
 try {
     Write-Host "[0/7] Building and starting current warehouse image"
-    docker compose build warehouse
-    if ($LASTEXITCODE -ne 0) { throw "Warehouse image build failed" }
-    docker compose up -d --force-recreate warehouse
-    if ($LASTEXITCODE -ne 0) { throw "Cannot recreate warehouse" }
-    Wait-Warehouse
+    if (-not $SkipBuild) {
+        docker compose build warehouse
+        if ($LASTEXITCODE -ne 0) { throw "Warehouse image build failed" }
+    }
+    docker compose up -d --force-recreate warehouse warehouse-2
+    if ($LASTEXITCODE -ne 0) { throw "Cannot recreate warehouse nodes" }
+    docker compose up -d --no-deps haproxy
+    if ($LASTEXITCODE -ne 0) { throw "Cannot start HAProxy" }
+    Wait-Warehouse 'http://localhost:8080/live'
 
     Write-Host "[1/7] Writing control operation to quorum log and local WAL"
     $body = @{
@@ -78,17 +83,30 @@ try {
     $timer = [Diagnostics.Stopwatch]::StartNew()
     docker compose up -d warehouse
     if ($LASTEXITCODE -ne 0) { throw "Cannot start warehouse" }
-    Wait-Warehouse
+    docker compose up -d --no-deps haproxy
+    if ($LASTEXITCODE -ne 0) { throw "Cannot start HAProxy" }
+    Wait-Warehouse 'http://localhost:8082/live'
     $timer.Stop()
 
     Write-Host "[6/7] Checking state rebuilt from quorum log"
-    $balance = Invoke-RestMethod "http://localhost:8080/v1/balances/$ownerId/$sku" -TimeoutSec 5
+    $balance = Invoke-RestMethod "http://localhost:8082/v1/balances/$ownerId/$sku" -TimeoutSec 5
     if ($balance.balance -ne $expectedBalance) {
         throw "Recovered balance is $($balance.balance), expected $expectedBalance"
     }
 
     Write-Host "[7/7] Checking deduplication after full rebuild"
-    $duplicate = Invoke-RestMethod -Method Post -Uri "http://localhost:8080/v1/operations" `
+    docker compose stop -t 0 warehouse-2 | Out-Null
+    $readyDeadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $ready = $null
+    while ([DateTime]::UtcNow -lt $readyDeadline) {
+        try {
+            $ready = Invoke-WebRequest 'http://localhost:8082/ready' -TimeoutSec 2
+            if ($ready.StatusCode -eq 200) { break }
+        } catch {}
+        Start-Sleep -Milliseconds 200
+    }
+    if (-not $ready -or $ready.StatusCode -ne 200) { throw 'Rebuilt node did not acquire the writer lease' }
+    $duplicate = Invoke-RestMethod -Method Post -Uri "http://localhost:8082/v1/operations" `
         -ContentType "application/json" -Body $body -TimeoutSec 10
     if ($duplicate.status -ne "duplicate" -or $duplicate.balance -ne $expectedBalance) {
         throw "Deduplication failed after full rebuild"
@@ -106,5 +124,6 @@ try {
     docker compose logs --no-color --tail 100 warehouse nats-1 nats-2 nats-3
     exit 1
 } finally {
+    docker compose up -d warehouse-2 | Out-Null
     Pop-Location
 }

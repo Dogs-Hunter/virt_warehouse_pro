@@ -58,23 +58,29 @@ impl std::fmt::Display for ConflictError {
 impl std::error::Error for ConflictError {}
 
 enum Command {
-    Apply {
-        operation: Operation,
-        persist: bool,
-        response: oneshot::Sender<anyhow::Result<ApplyResult>>,
+    ApplyBatch {
+        operations: Vec<(usize, Operation)>,
+        response: oneshot::Sender<anyhow::Result<Vec<(usize, ApplyResult)>>>,
     },
     Dump {
         response: oneshot::Sender<Vec<BalanceSnapshot>>,
     },
 }
 
+struct PublishCommand {
+    updates: Vec<(Key, i64)>,
+    completed: oneshot::Sender<()>,
+}
+
 #[derive(Clone)]
 pub struct Store {
     shards: Arc<Vec<mpsc::Sender<Command>>>,
+    wal: Wal,
     dedup: DedupShards,
     disk_dedup: DiskDedup,
     published_balances: Arc<RwLock<HashMap<Key, i64>>>,
-    disk_persist: mpsc::Sender<Vec<([u8; 32], [u8; 32], Operation)>>,
+    balance_publisher: mpsc::Sender<PublishCommand>,
+    disk_persist: mpsc::Sender<Vec<([u8; 32], [u8; 32])>>,
 }
 
 impl Store {
@@ -108,18 +114,22 @@ impl Store {
             let shard = shard_for(&operation.owner_id, &operation.sku, shard_count);
             *initial_balances[shard].entry((operation.owner_id, operation.sku)).or_default() += operation.delta;
             if recovered_entries.len() >= 100_000 {
-                disk_dedup.insert_operations(&recovered_entries)?;
+                let entries = recovered_entries.iter().map(|(key, fingerprint, _)| (*key, *fingerprint)).collect::<Vec<_>>();
+                disk_dedup.insert_many(&entries)?;
                 recovered_entries.clear();
             }
         }
-        disk_dedup.insert_operations(&recovered_entries)?;
+        let recovered_dedup = recovered_entries.iter().map(|(key, fingerprint, _)| (*key, *fingerprint)).collect::<Vec<_>>();
+        disk_dedup.insert_many(&recovered_dedup)?;
         disk_dedup.insert_many(&disk_entries)?;
 
-        let published_balances = initial_balances.iter().flat_map(|shard| shard.iter().map(|(key, value)| (key.clone(), *value))).collect();
+        let published_balances = Arc::new(RwLock::new(initial_balances.iter().flat_map(|shard| shard.iter().map(|(key, value)| (key.clone(), *value))).collect()));
+        let (balance_publisher, balance_receiver) = mpsc::channel(4096);
+        tokio::spawn(run_balance_publisher(balance_receiver, published_balances.clone()));
         let mut shards = Vec::with_capacity(shard_count);
         for balances in initial_balances {
             let (sender, receiver) = mpsc::channel(4096);
-            tokio::spawn(run_shard(receiver, wal.clone(), balances));
+            tokio::spawn(run_shard(receiver, balances));
             shards.push(sender);
         }
         let dedup: DedupShards = Arc::new(
@@ -127,125 +137,219 @@ impl Store {
                 .map(|_| Mutex::new(HashMap::<[u8; 32], DedupEntry>::new()))
                 .collect(),
         );
-        let (disk_persist, disk_receiver) = mpsc::channel(1024);
+        // Bound unmaterialized history. At high sustained ingest Redb can be
+        // slower than the quorum/WAL path; a small queue applies backpressure
+        // instead of retaining millions of cloned operations in RAM.
+        let (disk_persist, disk_receiver) = mpsc::channel(128);
         tokio::spawn(run_disk_persist(disk_receiver, disk_dedup.clone(), dedup.clone()));
         Ok(Self {
             shards: Arc::new(shards),
+            wal,
             dedup,
             disk_dedup,
-            published_balances: Arc::new(RwLock::new(published_balances)),
+            published_balances,
+            balance_publisher,
             disk_persist,
         })
     }
 
     pub async fn preflight_batch(&self, operations: &[Operation]) -> anyhow::Result<Vec<bool>> {
-        // Hashing strings is CPU work and does not need the shared dedup lock.
         let prepared = operations.iter().map(|operation| (
             operation_id_hash(&operation.operation_id),
             Fingerprint::from(operation),
         )).collect::<Vec<_>>();
-        loop {
-            let mut shard_ids = prepared.iter().map(|(key, _)| dedup_shard(key)).collect::<Vec<_>>();
-            shard_ids.sort_unstable();
-            shard_ids.dedup();
-            let mut guards = Vec::with_capacity(shard_ids.len());
-            for shard in &shard_ids { guards.push(self.dedup[*shard].lock().await); }
-            let mut staged = HashMap::<&str, &Operation>::new();
-            let mut new_operations = Vec::with_capacity(operations.len());
-            let mut fingerprints = Vec::with_capacity(operations.len());
-            let mut pending = None;
 
-            for (operation, (id_hash, fingerprint)) in operations.iter().zip(&prepared) {
-                if let Some(existing) = staged.get(operation.operation_id.as_str()) {
-                    if Fingerprint::from(*existing) != Fingerprint::from(operation) {
-                        return Err(ConflictError(operation.operation_id.clone()).into());
-                    }
-                    new_operations.push(false);
-                    fingerprints.push(None);
-                    continue;
+        // Validate duplicates inside the request before reserving shared state.
+        let mut first = HashMap::<&str, ([u8; 32], usize)>::new();
+        let mut unique = Vec::with_capacity(operations.len());
+        for (index, operation) in operations.iter().enumerate() {
+            match first.get(operation.operation_id.as_str()) {
+                Some((fingerprint, _)) if fingerprint != &prepared[index].1 => {
+                    return Err(ConflictError(operation.operation_id.clone()).into());
                 }
-                let guard_index = shard_ids.binary_search(&dedup_shard(id_hash)).expect("dedup shard locked");
-                match guards[guard_index].get(id_hash) {
-                    Some(DedupEntry::Committed(existing)) if existing != fingerprint => return Err(ConflictError(operation.operation_id.clone()).into()),
-                    Some(DedupEntry::Committed(_)) => { new_operations.push(false); fingerprints.push(None); }
-                    Some(DedupEntry::Pending { fingerprint: existing, notify }) => {
-                        if existing.as_ref() != Some(fingerprint) { return Err(ConflictError(operation.operation_id.clone()).into()); }
-                        pending=Some(notify.clone());break;
-                    }
-                    None => match self.disk_dedup.get(id_hash)? {
-                        Some(existing) if existing != *fingerprint => return Err(ConflictError(operation.operation_id.clone()).into()),
-                        Some(_) => { new_operations.push(false); fingerprints.push(None); }
-                        None => { new_operations.push(true); fingerprints.push(Some(*fingerprint)); }
-                    }
+                Some(_) => {}
+                None => {
+                    first.insert(operation.operation_id.as_str(), (prepared[index].1, index));
+                    unique.push(index);
                 }
-                staged.insert(operation.operation_id.as_str(), operation);
             }
-            if let Some(notify)=pending{let notified=notify.notified();drop(guards);notified.await;continue;}
-            let notify=Arc::new(Notify::new());
-            for (((_,is_new),fingerprint),(id_hash,_)) in operations.iter().zip(&new_operations).zip(fingerprints).zip(&prepared){if *is_new{let position=shard_ids.binary_search(&dedup_shard(id_hash)).expect("dedup shard locked");guards[position].insert(*id_hash,DedupEntry::Pending{fingerprint,notify:notify.clone()});}}
+        }
+
+        loop {
+            let reservation = Arc::new(Notify::new());
+            let mut new_operations = vec![false; operations.len()];
+            let mut reserved = Vec::with_capacity(unique.len());
+            let mut wait_for = None;
+            let mut conflict = None;
+
+            for shard_id in 0..DEDUP_SHARDS {
+                let indices = unique.iter().copied()
+                    .filter(|index| dedup_shard(&prepared[*index].0) == shard_id)
+                    .collect::<Vec<_>>();
+                if indices.is_empty() { continue; }
+                let mut memory = self.dedup[shard_id].lock().await;
+                let keys = indices.iter().map(|index| prepared[*index].0).collect::<Vec<_>>();
+                let disk_values = self.disk_dedup.get_many(&keys)?;
+                for (index, disk_value) in indices.into_iter().zip(disk_values) {
+                    let (id_hash, fingerprint) = prepared[index];
+                    match memory.get(&id_hash) {
+                        Some(DedupEntry::Committed(existing)) if existing != &fingerprint => {
+                            conflict = Some(operations[index].operation_id.clone());
+                            break;
+                        }
+                        Some(DedupEntry::Committed(_)) => {}
+                        Some(DedupEntry::Pending { fingerprint: existing, notify }) => {
+                            if existing.as_ref() != Some(&fingerprint) {
+                                conflict = Some(operations[index].operation_id.clone());
+                            } else {
+                                wait_for = Some(notify.clone().notified_owned());
+                            }
+                            break;
+                        }
+                        None => match disk_value {
+                            Some(existing) if existing != fingerprint => {
+                                conflict = Some(operations[index].operation_id.clone());
+                                break;
+                            }
+                            Some(_) => {}
+                            None => {
+                                memory.insert(id_hash, DedupEntry::Pending {
+                                    fingerprint: Some(fingerprint),
+                                    notify: reservation.clone(),
+                                });
+                                new_operations[index] = true;
+                                reserved.push(id_hash);
+                            }
+                        }
+                    }
+                }
+                drop(memory);
+                if conflict.is_some() || wait_for.is_some() { break; }
+            }
+
+            if let Some(notified) = wait_for {
+                self.rollback_reservation(&reserved, &reservation).await;
+                notified.await;
+                continue;
+            }
+            if let Some(operation_id) = conflict {
+                self.rollback_reservation(&reserved, &reservation).await;
+                return Err(ConflictError(operation_id).into());
+            }
             return Ok(new_operations);
         }
     }
 
+    async fn rollback_reservation(&self, keys: &[[u8; 32]], reservation: &Arc<Notify>) {
+        for shard_id in 0..DEDUP_SHARDS {
+            let shard_keys = keys.iter().filter(|key| dedup_shard(key) == shard_id).copied().collect::<Vec<_>>();
+            if shard_keys.is_empty() { continue; }
+            let mut memory = self.dedup[shard_id].lock().await;
+            for key in shard_keys {
+                if matches!(memory.get(&key), Some(DedupEntry::Pending { notify, .. }) if Arc::ptr_eq(notify, reservation)) {
+                    memory.remove(&key);
+                }
+            }
+        }
+        reservation.notify_waiters();
+    }
+
     pub async fn finish_batch(&self, operations: &[Operation], new_operations: &[bool], committed: bool) {
-        let keys = operations.iter().zip(new_operations).filter_map(|(operation, is_new)| is_new.then(|| operation_id_hash(&operation.operation_id))).collect::<Vec<_>>();
-        let mut shard_ids = keys.iter().map(dedup_shard).collect::<Vec<_>>();
-        shard_ids.sort_unstable();
-        shard_ids.dedup();
-        let mut guards = Vec::with_capacity(shard_ids.len());
-        for shard in &shard_ids { guards.push(self.dedup[*shard].lock().await); }
         let mut notifications = Vec::new();
         let mut disk_entries = Vec::new();
-        for (operation, is_new) in operations.iter().zip(new_operations) {
-            if !*is_new { continue; }
-            let id_hash = operation_id_hash(&operation.operation_id);
-            if committed {
-                let position = shard_ids.binary_search(&dedup_shard(&id_hash)).expect("dedup shard locked");
-                if let Some(entry) = guards[position].get(&id_hash) {
-                    if let DedupEntry::Pending { fingerprint, notify } = entry {
-                        disk_entries.push((id_hash, fingerprint.expect("pending fingerprint")));
+        let prepared = operations.iter().zip(new_operations).map(|(operation, is_new)| {
+            is_new.then(|| operation_id_hash(&operation.operation_id))
+        }).collect::<Vec<_>>();
+        let mut grouped = (0..DEDUP_SHARDS).map(|_| Vec::new()).collect::<Vec<Vec<usize>>>();
+        for (index, key) in prepared.iter().enumerate() {
+            if let Some(key) = key { grouped[dedup_shard(key)].push(index); }
+        }
+        for shard_id in 0..DEDUP_SHARDS {
+            if grouped[shard_id].is_empty() { continue; }
+            let mut memory = self.dedup[shard_id].lock().await;
+            for index in &grouped[shard_id] {
+                let id_hash = prepared[*index].expect("new operation key");
+                if committed {
+                    if let Some(DedupEntry::Pending { fingerprint, notify }) = memory.get(&id_hash) {
+                        let fingerprint = fingerprint.expect("pending fingerprint");
+                        disk_entries.push((id_hash, fingerprint));
                         notifications.push(notify.clone());
+                        memory.insert(id_hash, DedupEntry::Committed(fingerprint));
                     }
+                } else if let Some(DedupEntry::Pending { notify, .. }) = memory.remove(&id_hash) {
+                    notifications.push(notify);
                 }
-            } else { let position = shard_ids.binary_search(&dedup_shard(&id_hash)).expect("dedup shard locked"); if let Some(DedupEntry::Pending { notify, .. }) = guards[position].remove(&id_hash) {
-                notifications.push(notify);
-            }}
+            }
         }
         if committed {
-            let history_entries = operations.iter().zip(new_operations).filter_map(|(operation, is_new)| {
-                if !*is_new { return None; }
-                let key = operation_id_hash(&operation.operation_id);
-                disk_entries.iter().find(|(candidate, _)| candidate == &key)
-                    .map(|(_, fingerprint)| (key, *fingerprint, operation.clone()))
+            let updates = operations.iter().zip(new_operations).filter_map(|(operation, is_new)| {
+                is_new.then(|| ((operation.owner_id.clone(), operation.sku.clone()), operation.delta))
             }).collect::<Vec<_>>();
-            for (id_hash,fingerprint) in &disk_entries { let position=shard_ids.binary_search(&dedup_shard(id_hash)).expect("dedup shard locked"); if let Some(entry)=guards[position].get_mut(id_hash){*entry=DedupEntry::Committed(*fingerprint);} }
-            let mut published = self.published_balances.write().await;
-            for (operation, is_new) in operations.iter().zip(new_operations) {
-                if *is_new { *published.entry((operation.owner_id.clone(), operation.sku.clone())).or_default() += operation.delta; }
+            if !updates.is_empty() {
+                let (completed, response) = oneshot::channel();
+                if self.balance_publisher.send(PublishCommand { updates, completed }).await.is_err() || response.await.is_err() {
+                    tracing::error!("balance publisher stopped; committed state remains recoverable in WAL and quorum");
+                }
             }
-            drop(published);
-            drop(guards);
-            if !history_entries.is_empty() && self.disk_persist.send(history_entries).await.is_err() {
+            if !disk_entries.is_empty() && self.disk_persist.send(disk_entries).await.is_err() {
                 tracing::error!("disk materialization queue stopped; committed entries remain recoverable in WAL and quorum");
             }
-        } else { drop(guards); }
+        }
         for notify in notifications { notify.notify_waiters(); }
     }
 
     pub async fn apply_reserved_batch(&self, operations: Vec<Operation>) -> anyhow::Result<Vec<ApplyResult>> {
-        futures::future::join_all(operations.into_iter().map(|operation| self.apply_to_shard(operation, true)))
-            .await.into_iter().collect()
+        let mut indexed = self.apply_batched(operations.into_iter().enumerate().collect(), true).await?;
+        indexed.sort_by_key(|(index, _)| *index);
+        Ok(indexed.into_iter().map(|(_, result)| result).collect())
     }
 
     pub async fn apply_preflight_batch(&self, operations: Vec<Operation>, new_operations: &[bool]) -> anyhow::Result<Vec<ApplyResult>> {
-        futures::future::join_all(operations.into_iter().zip(new_operations.iter().copied()).map(|(operation, is_new)| async move {
-            if is_new {
-                self.apply_to_shard(operation, true).await
-            } else {
-                let balance = self.balance(operation.owner_id.clone(), operation.sku.clone()).await?;
-                Ok(ApplyResult { operation_id: operation.operation_id, status: ApplyStatus::Duplicate, balance })
+        let total = operations.len();
+        let mut results = (0..total).map(|_| None).collect::<Vec<Option<ApplyResult>>>();
+        let mut fresh = Vec::new();
+        {
+            let published = self.published_balances.read().await;
+            for (index, (operation, is_new)) in operations.into_iter().zip(new_operations.iter().copied()).enumerate() {
+                if is_new {
+                    fresh.push((index, operation));
+                } else {
+                    let balance = *published.get(&(operation.owner_id.clone(), operation.sku.clone())).unwrap_or(&0);
+                    results[index] = Some(ApplyResult { operation_id: operation.operation_id, status: ApplyStatus::Duplicate, balance });
+                }
             }
-        })).await.into_iter().collect()
+        }
+        for (index, result) in self.apply_batched(fresh, true).await? {
+            results[index] = Some(result);
+        }
+        results.into_iter().map(|result| result.ok_or_else(|| anyhow::anyhow!("missing state shard result"))).collect()
+    }
+
+    async fn apply_batched(&self, indexed: Vec<(usize, Operation)>, persist: bool) -> anyhow::Result<Vec<(usize, ApplyResult)>> {
+        if persist {
+            let durable = indexed.iter().map(|(_, operation)| operation.clone()).collect::<Vec<_>>();
+            self.wal.append_many(&durable).await?;
+        }
+        let mut groups = (0..self.shards.len()).map(|_| Vec::new()).collect::<Vec<Vec<(usize, Operation)>>>();
+        for (index, operation) in indexed {
+            let shard = shard_for(&operation.owner_id, &operation.sku, self.shards.len());
+            groups[shard].push((index, operation));
+        }
+        let replies = futures::future::join_all(groups.into_iter().enumerate().filter_map(|(shard, operations)| {
+            if operations.is_empty() { return None; }
+            let sender = self.shards[shard].clone();
+            Some(async move {
+                let (response, result) = oneshot::channel();
+                sender.send(Command::ApplyBatch { operations, response }).await
+                    .map_err(|_| anyhow::anyhow!("state shard stopped"))?;
+                result.await.map_err(|_| anyhow::anyhow!("state shard dropped batch response"))?
+            })
+        })).await;
+        let mut completed = Vec::new();
+        for reply in replies {
+            completed.extend(reply?);
+        }
+        Ok(completed)
     }
 
     pub async fn snapshot(&self, sequence: u64, writer_epoch: u64) -> anyhow::Result<SnapshotData> {
@@ -262,32 +366,30 @@ impl Store {
 
     pub fn disk_dedup_len(&self) -> anyhow::Result<u64> { self.disk_dedup.len() }
     pub fn history_len(&self) -> anyhow::Result<u64> { self.disk_dedup.history_len() }
+    pub fn disk_memory_metrics(&self) -> (u64, u64, u64, usize) { self.disk_dedup.memory_metrics() }
+    pub fn disk_bloom_ready(&self) -> bool { self.disk_dedup.bloom_ready() }
+    pub async fn runtime_cardinality(&self) -> (usize, usize, usize) {
+        let mut committed = 0;
+        let mut pending = 0;
+        for shard in self.dedup.iter() {
+            for entry in shard.lock().await.values() {
+                match entry { DedupEntry::Committed(_) => committed += 1, DedupEntry::Pending { .. } => pending += 1 }
+            }
+        }
+        (committed, pending, self.published_balances.read().await.len())
+    }
     pub fn history_progress(&self) -> anyhow::Result<(u64, u64)> { self.disk_dedup.history_progress() }
     pub fn prepare_binary_history_migration(&self) -> anyhow::Result<(u64, u64)> { self.disk_dedup.prepare_binary_history_migration() }
     pub fn complete_binary_history_migration(&self) -> anyhow::Result<()> { self.disk_dedup.complete_binary_history_migration() }
-    pub fn materialize_history(&self, sequence: u64, epoch: u64, operations: &[Operation]) -> anyhow::Result<()> {
-        self.disk_dedup.materialize_history(sequence, epoch, operations)
+    pub fn materialize_history_batch(&self, records: &[(u64, u64, Vec<Operation>)]) -> anyhow::Result<()> {
+        self.disk_dedup.materialize_history_batch(records)
     }
-    pub fn operation(&self, operation_id: &str) -> anyhow::Result<Option<Operation>> { self.disk_dedup.get_operation(&operation_id_hash(operation_id)) }
-    pub fn operations(&self, operation_ids: &[String]) -> anyhow::Result<Vec<Operation>> {
-        let keys = operation_ids.iter().map(|id| operation_id_hash(id)).collect::<Vec<_>>();
-        self.disk_dedup.get_operations(&keys)
-    }
+    pub fn operation(&self, operation_id: &str) -> anyhow::Result<Option<Operation>> { self.disk_dedup.get_operation(operation_id) }
+    pub fn operations(&self, operation_ids: &[String]) -> anyhow::Result<Vec<Operation>> { self.disk_dedup.get_operations(operation_ids) }
+    pub fn scan_operations(&self, cursor: Option<&str>, limit: usize) -> anyhow::Result<Vec<Operation>> { self.disk_dedup.scan_operations(cursor, limit) }
     pub fn operations_by_owner(&self, owner: &str, cursor: Option<&str>, limit: usize) -> anyhow::Result<Vec<Operation>> { self.disk_dedup.by_owner(owner, cursor, limit) }
     pub fn operations_by_sku(&self, sku: &str, cursor: Option<&str>, limit: usize) -> anyhow::Result<Vec<Operation>> { self.disk_dedup.by_sku(sku, cursor, limit) }
     pub fn sync_disk_dedup(&self) -> anyhow::Result<()> { self.disk_dedup.sync() }
-
-    async fn apply_to_shard(&self, operation: Operation, persist: bool) -> anyhow::Result<ApplyResult> {
-        let shard = shard_for(&operation.owner_id, &operation.sku, self.shards.len());
-        let (response, result) = oneshot::channel();
-        self.shards[shard]
-            .send(Command::Apply { operation, persist, response })
-            .await
-            .map_err(|_| anyhow::anyhow!("state shard stopped"))?;
-        result
-            .await
-            .map_err(|_| anyhow::anyhow!("state shard dropped response"))?
-    }
 
     pub async fn restore_chunk(&self, operations: Vec<Operation>) -> anyhow::Result<()> {
         let new_operations = self.preflight_batch(&operations).await?;
@@ -317,10 +419,42 @@ impl Store {
         values
     }
 
+    pub async fn balances(&self, keys: &[(String, String)]) -> Vec<i64> {
+        let published = self.published_balances.read().await;
+        keys.iter().map(|key| *published.get(key).unwrap_or(&0)).collect()
+    }
+
+}
+
+async fn run_balance_publisher(
+    mut receiver: mpsc::Receiver<PublishCommand>,
+    balances: Arc<RwLock<HashMap<Key, i64>>>,
+) {
+    while let Some(first) = receiver.recv().await {
+        let mut batch = vec![first];
+        // Give concurrently finishing requests one scheduler turn to join this
+        // publication without imposing a fixed latency window.
+        tokio::task::yield_now().await;
+        while batch.len() < 256 {
+            match receiver.try_recv() {
+                Ok(command) => batch.push(command),
+                Err(_) => break,
+            }
+        }
+        {
+            let mut published = balances.write().await;
+            for command in &batch {
+                for (key, delta) in &command.updates {
+                    *published.entry(key.clone()).or_default() += delta;
+                }
+            }
+        }
+        for command in batch { let _ = command.completed.send(()); }
+    }
 }
 
 async fn run_disk_persist(
-    mut receiver: mpsc::Receiver<Vec<([u8; 32], [u8; 32], Operation)>>,
+    mut receiver: mpsc::Receiver<Vec<([u8; 32], [u8; 32])>>,
     disk: DiskDedup,
     dedup: DedupShards,
 ) {
@@ -335,10 +469,14 @@ async fn run_disk_persist(
                 Err(_) => break,
             }
         }
-        let persisted = combined.iter().map(|(key, fingerprint, _)| (*key, *fingerprint)).collect::<Vec<_>>();
+        let persisted = combined.clone();
         let disk_clone = disk.clone();
-        let write_entries = combined;
-        match tokio::task::spawn_blocking(move || disk_clone.insert_operations(&write_entries)).await {
+        let mut write_entries = combined;
+        // SHA-256 keys are uniformly random. Feeding them to a copy-on-write
+        // B-tree in arrival order causes excessive page churn as the index
+        // grows; ordered bulk insertion keeps the hot write set sequential.
+        write_entries.sort_unstable_by_key(|(key, _)| *key);
+        match tokio::task::spawn_blocking(move || disk_clone.insert_many(&write_entries)).await {
             Ok(Ok(())) => {
                 for (key, fingerprint) in persisted {
                     let mut memory=dedup[dedup_shard(&key)].lock().await;
@@ -355,11 +493,8 @@ async fn run_disk_persist(
 
 async fn run_shard(
     mut receiver: mpsc::Receiver<Command>,
-    wal: Wal,
     mut balances: HashMap<Key, i64>,
 ) {
-    let mut applied = HashSet::<String>::new();
-
     while let Some(first) = receiver.recv().await {
         let mut commands = Vec::with_capacity(1024);
         commands.push(first);
@@ -370,37 +505,6 @@ async fn run_shard(
             }
         }
 
-        let mut staged = HashSet::new();
-        let durable = commands
-            .iter()
-            .filter_map(|command| match command {
-                Command::Apply { operation, persist, .. }
-                    if *persist && !applied.contains(&operation.operation_id)
-                        && staged.insert(operation.operation_id.clone()) =>
-                {
-                    Some(operation.clone())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        if let Err(error) = wal.append_many(&durable).await {
-            let message = error.to_string();
-            for command in commands {
-                match command {
-                    Command::Apply { response, .. } => {
-                        let _ = response.send(Err(anyhow::anyhow!(message.clone())));
-                    }
-                    Command::Dump { response } => {
-                        let _ = response.send(balances.iter().map(|((owner_id, sku), balance)| BalanceSnapshot {
-                            owner_id: owner_id.clone(), sku: sku.clone(), balance: *balance,
-                        }).collect());
-                    }
-                }
-            }
-            continue;
-        }
-
         for command in commands {
             match command {
                 Command::Dump { response } => {
@@ -408,28 +512,19 @@ async fn run_shard(
                         owner_id: owner_id.clone(), sku: sku.clone(), balance: *balance,
                     }).collect());
                 }
-                Command::Apply {
-                    operation,
-                    persist: _,
-                    response,
-                } => {
-                    let key = (operation.owner_id.clone(), operation.sku.clone());
-                    if applied.contains(&operation.operation_id) {
-                        let _ = response.send(Ok(ApplyResult {
+                Command::ApplyBatch { operations, response } => {
+                    let mut results = Vec::with_capacity(operations.len());
+                    for (index, operation) in operations {
+                        let key = (operation.owner_id.clone(), operation.sku.clone());
+                        let balance = balances.entry(key).or_default();
+                        *balance += operation.delta;
+                        results.push((index, ApplyResult {
                             operation_id: operation.operation_id,
-                            status: ApplyStatus::Duplicate,
-                            balance: *balances.get(&key).unwrap_or(&0),
+                            status: ApplyStatus::Applied,
+                            balance: *balance,
                         }));
-                        continue;
                     }
-                    let balance = balances.entry(key).or_default();
-                    *balance += operation.delta;
-                    applied.insert(operation.operation_id.clone());
-                    let _ = response.send(Ok(ApplyResult {
-                        operation_id: operation.operation_id,
-                        status: ApplyStatus::Applied,
-                        balance: *balance,
-                    }));
+                    let _ = response.send(Ok(results));
                 }
             }
         }

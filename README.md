@@ -5,14 +5,28 @@
 
 Подтверждённые измерения находятся в [docs/RESULTS.md](docs/RESULTS.md).
 
-## Гарантия текущего этапа
+## Гарантия доставки
 
-HTTP 200 возвращается только после записи операции в WAL и `sync_data`. Повторный
-`operation_id` не изменяет баланс. После штатного или аварийного перезапуска состояние
-восстанавливается воспроизведением WAL.
+Система обеспечивает **at-least-once delivery**:
 
-Это пока **одиночный узел**. Он защищает от падения процесса, но не от потери диска или
-машины. Репликация и автоматическое лидерство будут следующим отдельным этапом.
+1. Операция сначала фиксируется в трёхузловом JetStream quorum.
+2. Затем она записывается в локальный WAL с `sync_data` и применяется к состоянию.
+3. Только после этого клиент получает успешный HTTP-ответ.
+4. Durable checkpoint продвигается только после успешного локального применения.
+5. При аварии между quorum commit и ответом операция повторно читается из JetStream.
+
+Повторная доставка разрешена и ожидаема. Идемпотентность по `operation_id` гарантирует,
+что повтор не изменит баланс второй раз. Одинаковые немедленные публикации дополнительно
+схлопываются JetStream по детерминированному `Nats-Msg-Id`.
+
+Гарантия проверяется отдельным аварийным тестом:
+
+```powershell
+.\scripts\test-at-least-once-delivery.ps1 -SkipBuild
+```
+
+Тест убивает процесс после quorum commit, но до WAL и HTTP-ответа, ждёт автоматическую
+доставку после перезапуска и проверяет безопасный повтор запроса.
 
 ## Запуск
 
@@ -56,15 +70,17 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8080/v1/operations `
 
 После перезапуска ожидаются `status = duplicate` и `balance = 10`.
 
-Автоматизированный тест аварийного восстановления без очистки существующих данных:
+## Воспроизводимая сборка
+
+Версия Rust, базовый runtime и сторонние контейнеры закреплены точными digest. Rust-зависимости
+закреплены в `Cargo.lock`, а сборка всегда использует `--locked` и автоматически запускает
+unit-тесты. Полная проверка выполняется отдельным файлом:
 
 ```powershell
-.\scripts\test-crash-recovery.ps1
+.\scripts\test-reproducible-build.ps1 -NoCache
 ```
 
-Он создаёт уникальную контрольную операцию, посылает процессу `SIGKILL`, измеряет RTO,
-проверяет восстановленный баланс и дедупликацию после перезапуска. Успешный итог —
-`result: PASSED`.
+Без `-NoCache` проверка использует безопасный кеш компилятора и выполняется быстрее.
 
 ## Baseline производительности
 
@@ -77,99 +93,48 @@ docker compose --profile benchmark run --rm loadgen
 Итог содержит `operations`, `applied`, `duplicates`, полное время и средний throughput.
 Для нового `LOAD_RUN_ID` ожидается `applied=1000000` и `duplicates=0`.
 
-## Quorum failover под нагрузкой
+## Основные интеграционные тесты
 
 ```powershell
 .\scripts\test-quorum-failover.ps1
 ```
 
-Тест автоматически находит лидера replicated stream, запускает 5 млн операций, аварийно
-останавливает лидера, измеряет election, требует успешного завершения всей нагрузки,
-проверяет точный баланс и возвращает остановленный узел в кластер.
-
-Проверка сборки, перезапуска и полного quorum catch-up:
-
-```powershell
-.\scripts\test-quorum-catchup.ps1
-```
-
-Разрушительный тест потери только локального application volume:
-
 ```powershell
 .\scripts\test-local-volume-loss.ps1
 ```
-
-Сценарий проверяет Compose-label перед удалением и никогда не удаляет NATS volumes.
-
-Проверка непрерывной прикладной реплики:
-
-```powershell
-.\scripts\test-live-replica.ps1
-```
-
-Проверка автоматического failover прикладного узла:
 
 ```powershell
 .\scripts\test-application-failover.ps1
 ```
 
-Полный тест производительности через HAProxy и quorum:
-
 ```powershell
-.\scripts\test-performance.ps1
+.\scripts\test-at-least-once-delivery.ps1 -SkipBuild
 ```
 
-Проверка глобальных конфликтующих дублей:
-
 ```powershell
-.\scripts\test-conflicting-duplicate.ps1
+.\scripts\test-prepared-read-write-performance.ps1 -SkipBuild
 ```
 
-Конкурентный конфликт и повтор после failover:
+Подготовка набора данных для теста производительности:
 
 ```powershell
-.\scripts\test-concurrent-conflict.ps1
+.\scripts\prepare-performance-dataset.ps1 -SkipBuild
 ```
 
-Атомарный отказ всего пакета при конфликтующем `operation_id`:
+## Зафиксированные ограничения тестового стенда
 
-```powershell
-.\scripts\test-batch-conflict.ps1
-```
-
-Потеря quorum без зависания и без локальной «призрачной» записи:
-
-```powershell
-.\scripts\test-quorum-loss.ps1
-```
-
-Авария primary после quorum commit, но до локального применения:
-
-```powershell
-.\scripts\test-post-quorum-crash.ps1
-```
-
-Автоматическое восстановление после повреждения локального WAL:
-
-```powershell
-.\scripts\test-wal-corruption-recovery.ps1
-```
-
-Quorum-backed writer lease и защита от двух активных writers:
-
-```powershell
-.\scripts\test-writer-fencing.ps1
-```
-
-Изоляция повреждённого replicated event в DLQ:
-
-```powershell
-.\scripts\test-poison-dlq.ps1
-```
+- Значения API key, NATS credentials и пароля Grafana пока намеренно остаются тестовыми и
+  встроенными в Compose, чтобы стенд можно было передать и запустить без внешнего secret store.
+- Все реплики пока запускаются на одном Docker-хосте. Это проверяет программное переключение,
+  но не защищает от потери всей машины.
+- Усиление аутентификации, управление секретами и multi-host deployment отложены: безопасность
+  на текущем этапе не является приоритетом.
+- Эти ограничения допустимы только для закрытого тестового окружения и должны быть сняты перед
+  подключением реальных данных или публикацией сервиса в интернет.
 
 ## Формат WAL
 
-Каждая запись имеет заголовок `payload_length:u32 LE`, `crc32:u32 LE`, затем JSON payload.
+Каждая запись имеет заголовок `payload_length:u32 LE`, `crc32:u32 LE`, затем бинарный payload.
 Неполная последняя запись после внезапного отключения удаляется при восстановлении. Ошибка
 checksum внутри журнала останавливает запуск, чтобы повреждение не превратилось в молчаливую
 потерю данных.

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Operation {
     pub operation_id: String,
     pub owner_id: String,
@@ -52,4 +52,33 @@ pub struct ApplyResult {
 pub enum ApplyStatus {
     Applied,
     Duplicate,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn operation() -> Operation {
+        Operation { operation_id: "op-1".into(), owner_id: "owner-1".into(), sku: "sku-1".into(), delta: 1, event_version: 1 }
+    }
+
+    #[test]
+    fn accepts_valid_boundary_values() {
+        let mut value = operation();
+        value.delta = 1_000_000_000;
+        assert!(value.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_business_values() {
+        let mut value = operation();
+        value.delta = 0;
+        assert!(value.validate().is_err());
+        value.delta = 1;
+        value.operation_id = " op-1".into();
+        assert!(value.validate().is_err());
+        value.operation_id = "op-1".into();
+        value.event_version = 2;
+        assert!(value.validate().is_err());
+    }
 }

@@ -8,6 +8,9 @@ mod snapshot;
 mod state;
 mod wal;
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::{path::PathBuf, sync::{Arc, atomic::{AtomicU64, Ordering}}, time::{Duration, Instant}};
 
 use axum::{
@@ -24,7 +27,7 @@ use checkpoint::Checkpoint;
 use dedup_disk::DiskDedup;
 use futures::{stream, StreamExt};
 use model::{ApplyResult, Operation};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use state::Store;
 use wal::Wal;
 
@@ -39,7 +42,12 @@ struct AppState {
     wal_path: Arc<PathBuf>,
     metrics: Arc<Metrics>,
     history_checkpoint: Arc<AtomicU64>,
+    history_read_limit: Arc<tokio::sync::Semaphore>,
+    storage_counts: Arc<StorageCounts>,
 }
+
+#[derive(Default)]
+struct StorageCounts { dedup: AtomicU64, history: AtomicU64 }
 
 #[derive(Default)]
 struct Metrics {
@@ -82,8 +90,16 @@ struct OwnerBalance { sku: String, balance: i64 }
 #[derive(Serialize)]
 struct OwnerSummary { owner_id: String, generation: u64, total_balance: i64, positions: Vec<OwnerBalance> }
 
+#[derive(Deserialize)]
+struct BalanceKey { owner_id: String, sku: String }
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--healthcheck") {
+        let response = reqwest::get("http://127.0.0.1:8080/live").await?;
+        anyhow::ensure!(response.status().is_success(), "health endpoint returned {}", response.status());
+        return Ok(());
+    }
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warehouse_lab=info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
@@ -173,7 +189,9 @@ async fn main() -> anyhow::Result<()> {
     store.sync_disk_dedup()?;
     snapshot::save(&snapshot_path, &compacted).await?;
     wal.reset().await?;
-    tracing::info!(sequence = compact_sequence, balances = compacted.balances.len(), dedup = store.disk_dedup_len()?, "state snapshot committed and WAL compacted");
+    let initial_dedup_entries = store.disk_dedup_len()?;
+    let initial_history_entries = store.history_len()?;
+    tracing::info!(sequence = compact_sequence, balances = compacted.balances.len(), dedup = initial_dedup_entries, "state snapshot committed and WAL compacted");
     if config.live_tail {
         if let Some(log) = replicated_log.clone() {
             tokio::spawn(run_live_tail(store.clone(), log, checkpoint.clone()));
@@ -188,6 +206,11 @@ async fn main() -> anyhow::Result<()> {
         Some(log) => Some(log.start_writer_lease(config.instance_id.clone(), config.writer_priority_delay).await?),
         None => None,
     };
+    let storage_counts = Arc::new(StorageCounts {
+        dedup: AtomicU64::new(initial_dedup_entries),
+        history: AtomicU64::new(initial_history_entries),
+    });
+    tokio::spawn(run_storage_count_refresh(store.clone(), storage_counts.clone()));
     let state = AppState {
         store,
         started: Arc::new(Instant::now()),
@@ -198,6 +221,8 @@ async fn main() -> anyhow::Result<()> {
         wal_path: Arc::new(wal_path),
         metrics: Arc::new(Metrics::default()),
         history_checkpoint,
+        history_read_limit: Arc::new(tokio::sync::Semaphore::new(8)),
+        storage_counts,
     };
     let app = Router::new()
         .route("/live", get(live))
@@ -206,10 +231,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/operations", post(apply_one))
         .route("/v1/operations/:operation_id", get(get_operation))
         .route("/v1/operations/read-batch", post(get_operations_batch))
+        .route("/v1/operations/scan", get(scan_operations))
         .route("/v1/operations/by-owner/:owner_id", get(get_operations_by_owner))
         .route("/v1/operations/by-sku/:sku", get(get_operations_by_sku))
         .route("/v1/operations/batch", post(apply_batch))
         .route("/v1/balances/:owner_id/:sku", get(get_balance))
+        .route("/v1/balances/read-batch", post(get_balances_batch))
         .route("/v1/balances/:owner_id", get(get_owner_balances))
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(state);
@@ -217,6 +244,21 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(address = %config.bind, "warehouse lab started");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn run_storage_count_refresh(store: Store, counts: Arc<StorageCounts>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let reader = store.clone();
+        match tokio::task::spawn_blocking(move || Ok::<_, anyhow::Error>((reader.disk_dedup_len()?, reader.history_len()?))).await {
+            Ok(Ok((dedup, history))) => {
+                counts.dedup.store(dedup, Ordering::Relaxed);
+                counts.history.store(history, Ordering::Relaxed);
+            }
+            Ok(Err(error)) => tracing::warn!(%error, "cannot refresh storage entry metrics"),
+            Err(error) => tracing::warn!(%error, "storage entry metrics task failed"),
+        }
+    }
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
@@ -240,11 +282,14 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let dedup_path = state.wal_path.with_file_name("dedup.redb");
     let dedup_bytes = tokio::fs::metadata(&dedup_path).await.map_or(0, |value| value.len());
     let history_bytes = tokio::fs::metadata(state.wal_path.with_file_name("history.redb")).await.map_or(0, |value| value.len());
-    let dedup_entries = state.store.disk_dedup_len().unwrap_or(0);
-    let history_entries = state.store.history_len().unwrap_or(0);
+    let dedup_entries = state.storage_counts.dedup.load(Ordering::Relaxed);
+    let history_entries = state.storage_counts.history.load(Ordering::Relaxed);
     let history_checkpoint = state.history_checkpoint.load(Ordering::Acquire);
     let history_lag = last_sequence.saturating_sub(history_checkpoint);
     let memory_bytes = process_memory_bytes().await.unwrap_or(0);
+    let (memory_dedup_committed, memory_dedup_pending, balance_positions) = state.store.runtime_cardinality().await;
+    let (lsm_cache_bytes, lsm_cache_capacity_bytes, lsm_write_buffer_bytes, lsm_outstanding_flushes) = state.store.disk_memory_metrics();
+    let disk_bloom_ready = u8::from(state.store.disk_bloom_ready());
     let lag = last_sequence.saturating_sub(checkpoint);
     let body = format!(concat!(
         "# TYPE warehouse_operations_applied_total counter\nwarehouse_operations_applied_total {}\n",
@@ -259,6 +304,13 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         "# TYPE warehouse_replication_lag gauge\nwarehouse_replication_lag {}\n",
         "# TYPE warehouse_wal_bytes gauge\nwarehouse_wal_bytes {}\n",
         "# TYPE warehouse_process_memory_bytes gauge\nwarehouse_process_memory_bytes {}\n",
+        "# TYPE warehouse_memory_dedup_committed gauge\nwarehouse_memory_dedup_committed {}\n",
+        "# TYPE warehouse_memory_dedup_pending gauge\nwarehouse_memory_dedup_pending {}\n",
+        "# TYPE warehouse_balance_positions gauge\nwarehouse_balance_positions {}\n",
+        "# TYPE warehouse_lsm_cache_bytes gauge\nwarehouse_lsm_cache_bytes {}\n",
+        "# TYPE warehouse_lsm_cache_capacity_bytes gauge\nwarehouse_lsm_cache_capacity_bytes {}\n",
+        "# TYPE warehouse_lsm_write_buffer_bytes gauge\nwarehouse_lsm_write_buffer_bytes {}\n",
+        "# TYPE warehouse_lsm_outstanding_flushes gauge\nwarehouse_lsm_outstanding_flushes {}\n",
         "# TYPE warehouse_disk_dedup_entries gauge\nwarehouse_disk_dedup_entries {}\n",
         "# TYPE warehouse_disk_dedup_bytes gauge\nwarehouse_disk_dedup_bytes {}\n"
         ,"# TYPE warehouse_history_entries gauge\nwarehouse_history_entries {}\n"
@@ -268,7 +320,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         ,"# TYPE warehouse_stream_messages gauge\nwarehouse_stream_messages {}\n"
         ,"# TYPE warehouse_stream_bytes gauge\nwarehouse_stream_bytes {}\n"
         ,"# TYPE warehouse_stream_max_bytes gauge\nwarehouse_stream_max_bytes {}\n"
-        ,"# TYPE warehouse_pipeline_batch_requests_total counter\nwarehouse_pipeline_batch_requests_total {}\n"
+        ,"# TYPE warehouse_disk_bloom_ready gauge\nwarehouse_disk_bloom_ready {}\n# TYPE warehouse_pipeline_batch_requests_total counter\nwarehouse_pipeline_batch_requests_total {}\n"
         ,"# TYPE warehouse_pipeline_operations_total counter\nwarehouse_pipeline_operations_total {}\n"
         ,"# TYPE warehouse_pipeline_json_decode_seconds_total counter\nwarehouse_pipeline_json_decode_seconds_total {:.9}\n"
         ,"# TYPE warehouse_pipeline_preflight_seconds_total counter\nwarehouse_pipeline_preflight_seconds_total {:.9}\n"
@@ -278,9 +330,12 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         ,"# TYPE warehouse_pipeline_handler_seconds_total counter\nwarehouse_pipeline_handler_seconds_total {:.9}\n"
     ), state.metrics.applied.load(Ordering::Relaxed), state.metrics.duplicates.load(Ordering::Relaxed),
        state.metrics.conflicts.load(Ordering::Relaxed), state.metrics.unavailable.load(Ordering::Relaxed),
-       quorum, lease, writer_epoch, checkpoint, last_sequence, lag, wal_bytes, memory_bytes, dedup_entries, dedup_bytes, history_entries, history_bytes, history_checkpoint, history_lag,
+       quorum, lease, writer_epoch, checkpoint, last_sequence, lag, wal_bytes, memory_bytes,
+       memory_dedup_committed, memory_dedup_pending, balance_positions, lsm_cache_bytes, lsm_cache_capacity_bytes,
+       lsm_write_buffer_bytes, lsm_outstanding_flushes,
+       dedup_entries, dedup_bytes, history_entries, history_bytes, history_checkpoint, history_lag,
        stream_messages, stream_bytes, stream_max_bytes,
-       state.metrics.batch_requests.load(Ordering::Relaxed), state.metrics.pipeline_operations.load(Ordering::Relaxed),
+       disk_bloom_ready, state.metrics.batch_requests.load(Ordering::Relaxed), state.metrics.pipeline_operations.load(Ordering::Relaxed),
        seconds(state.metrics.json_decode_ns.load(Ordering::Relaxed)), seconds(state.metrics.preflight_ns.load(Ordering::Relaxed)),
        seconds(state.metrics.quorum_ns.load(Ordering::Relaxed)), seconds(state.metrics.apply_ns.load(Ordering::Relaxed)),
        seconds(state.metrics.finish_ns.load(Ordering::Relaxed)), seconds(state.metrics.handler_ns.load(Ordering::Relaxed)));
@@ -330,6 +385,7 @@ async fn run_live_tail(store: Store, log: ReplicatedLog, checkpoint: Checkpoint)
 }
 
 async fn run_history_tail(store: Store, log: ReplicatedLog, published: Arc<AtomicU64>) {
+    const HISTORY_BATCH_RECORDS: usize = 16;
     loop {
         let (current, mut epoch) = match store.history_progress() {
             Ok(value) => value,
@@ -341,6 +397,10 @@ async fn run_history_tail(store: Store, log: ReplicatedLog, published: Arc<Atomi
         };
         match log.last_sequence().await {
             Ok(last) if last > current => {
+                // Keep history transactions large enough to amortize redb's
+                // copy-on-write cost, but bounded so two replicas cannot create
+                // large simultaneous memory and I/O spikes.
+                let mut batch = Vec::with_capacity(HISTORY_BATCH_RECORDS);
                 for sequence in current.saturating_add(1)..=last {
                     let record = match log.read(sequence).await {
                         Ok(value) => value,
@@ -354,11 +414,20 @@ async fn run_history_tail(store: Store, log: ReplicatedLog, published: Arc<Atomi
                         LogRecord::Operations { epoch: record_epoch, operations } if record_epoch == epoch => operations,
                         LogRecord::Operations { .. } => Vec::new(),
                     };
-                    if let Err(error) = store.materialize_history(sequence, epoch, &operations) {
-                        tracing::error!(sequence, %error, "history backfill write failed");
-                        break;
+                    batch.push((sequence, epoch, operations));
+                    if batch.len() == HISTORY_BATCH_RECORDS || sequence == last {
+                        // redb history maintenance is blocking disk work. Running it
+                        // on Tokio workers used to starve /live long enough for
+                        // Docker to restart a healthy node on large backfills.
+                        let writer = store.clone();
+                        let write_batch = std::mem::replace(&mut batch, Vec::with_capacity(HISTORY_BATCH_RECORDS));
+                        let result = tokio::task::spawn_blocking(move || writer.materialize_history_batch(&write_batch)).await;
+                        if let Err(error) = result.unwrap_or_else(|error| Err(anyhow::anyhow!("history writer task failed: {error}"))) {
+                            tracing::error!(sequence, %error, "history backfill write failed");
+                            break;
+                        }
+                        published.store(sequence, Ordering::Release);
                     }
-                    published.store(sequence, Ordering::Release);
                 }
                 if published.load(Ordering::Acquire) == last {
                     if let Err(error) = store.sync_disk_dedup() { tracing::error!(%error, "history backfill sync failed"); }
@@ -451,6 +520,12 @@ async fn get_owner_balances(State(state): State<AppState>, Path(owner_id): Path<
     Json(OwnerSummary { owner_id, generation: state.checkpoint.current().await, total_balance, positions })
 }
 
+async fn get_balances_batch(State(state): State<AppState>, Json(keys): Json<Vec<BalanceKey>>) -> Result<Json<Vec<i64>>, (StatusCode, Json<ErrorBody>)> {
+    if keys.is_empty() || keys.len() > 10_000 { return Err(bad_request("balance batch must contain 1..=10000 keys")); }
+    let keys = keys.into_iter().map(|key| (key.owner_id, key.sku)).collect::<Vec<_>>();
+    Ok(Json(state.store.balances(&keys).await))
+}
+
 async fn get_operation(State(state): State<AppState>, Path(operation_id): Path<String>) -> impl IntoResponse {
     if let Err(error) = ensure_history_complete(&state).await { return error.into_response(); }
     match state.store.operation(&operation_id) {
@@ -461,11 +536,22 @@ async fn get_operation(State(state): State<AppState>, Path(operation_id): Path<S
 }
 
 async fn get_operations_batch(State(state): State<AppState>, body: Bytes) -> Result<Json<Vec<Operation>>, (StatusCode, Json<ErrorBody>)> {
-    ensure_history_complete(&state).await?;
     let ids: Vec<String> = serde_json::from_slice(&body).map_err(|error| bad_request(format!("invalid JSON ID batch: {error}")))?;
     if ids.is_empty() || ids.len() > 10_000 { return Err(bad_request("read batch must contain 1..=10000 IDs")); }
-    let operations = state.store.operations(&ids).map_err(internal)?;
-    if operations.len() != ids.len() { return Err((StatusCode::NOT_FOUND, Json(ErrorBody { error: "one or more operations were not found".into() }))); }
+    let expected = ids.len();
+    let _permit = state.history_read_limit.clone().acquire_owned().await
+        .map_err(|error| internal(anyhow::anyhow!("history reader unavailable: {error}")))?;
+    let store = state.store.clone();
+    let operations = tokio::task::spawn_blocking(move || store.operations(&ids)).await
+        .map_err(|error| internal(anyhow::anyhow!("history reader task failed: {error}")))?
+        .map_err(internal)?;
+    if operations.len() != expected {
+        // Existing rows are safe to serve while the asynchronous history index
+        // catches up with newer writes. Only a missing row is ambiguous: it may
+        // still be in flight, so report rebuilding until the checkpoint catches up.
+        ensure_history_complete(&state).await?;
+        return Err((StatusCode::NOT_FOUND, Json(ErrorBody { error: "one or more operations were not found".into() })));
+    }
     Ok(Json(operations))
 }
 
@@ -478,6 +564,20 @@ struct HistoryPage { operations: Vec<Operation>, next_cursor: Option<String> }
 fn history_page(operations: Vec<Operation>, limit: usize) -> HistoryPage {
     let next_cursor = (operations.len() == limit).then(|| operations.last().unwrap().operation_id.clone());
     HistoryPage { operations, next_cursor }
+}
+
+async fn scan_operations(State(state): State<AppState>, Query(query): Query<HistoryQuery>) -> Result<Json<HistoryPage>, (StatusCode, Json<ErrorBody>)> {
+    ensure_history_complete(&state).await?;
+    let limit = query.limit.unwrap_or(10_000);
+    if !(1..=10_000).contains(&limit) { return Err(bad_request("limit must be 1..=10000")); }
+    let _permit = state.history_read_limit.clone().acquire_owned().await
+        .map_err(|error| internal(anyhow::anyhow!("history scanner unavailable: {error}")))?;
+    let store = state.store.clone();
+    let cursor = query.cursor;
+    let operations = tokio::task::spawn_blocking(move || store.scan_operations(cursor.as_deref(), limit)).await
+        .map_err(|error| internal(anyhow::anyhow!("history scanner task failed: {error}")))?
+        .map_err(internal)?;
+    Ok(Json(history_page(operations, limit)))
 }
 
 async fn get_operations_by_owner(State(state): State<AppState>, Path(owner): Path<String>, Query(query): Query<HistoryQuery>) -> Result<Json<HistoryPage>, (StatusCode, Json<ErrorBody>)> {

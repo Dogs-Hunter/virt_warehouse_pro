@@ -10,6 +10,8 @@ axum = { version = "0.7", features = ["json"] }
 bytes = "1"
 crc32fast = "1"
 futures = "0.3"
+fjall = "=3.1.10"
+mimalloc = { version = "=0.1.48", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 redb = "=4.3.0"
 serde = { version = "1", features = ["derive"] }

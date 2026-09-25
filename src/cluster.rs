@@ -3,6 +3,7 @@ use std::{sync::Arc, time::{Duration, Instant}};
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, stream::{DiscardPolicy, StorageType}};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{sync::RwLock, time::sleep};
 
 use crate::{binary::{self, BinaryLogRecord}, model::Operation};
@@ -112,9 +113,16 @@ impl ReplicatedLog {
             return Ok(0);
         }
         let payload = binary::encode_log_operations(epoch, operations)?;
+        // A publish acknowledgement may be lost after the quorum has already
+        // committed the message. Reusing the payload digest lets JetStream
+        // collapse an immediate producer retry while application deduplication
+        // still protects retries outside the server duplicate window.
+        let message_id = format!("operations-{:x}", Sha256::digest(&payload));
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert("Nats-Msg-Id", message_id);
         let acknowledgement = self
             .context
-            .publish(SUBJECT, payload.into())
+            .publish_with_headers(SUBJECT, headers, payload.into())
             .await
             .context("replicated publish failed")?
             .await
@@ -218,13 +226,13 @@ impl ReplicatedLog {
         let log = self.clone();
         tokio::spawn(async move {
             loop {
-                let renewed = match store.entry(WRITER_KEY).await {
+                let (renewed, definitely_lost) = match store.entry(WRITER_KEY).await {
                     Ok(Some(entry)) => match serde_json::from_slice::<LeaseValue>(&entry.value) {
                         Ok(value) if value.instance_id == instance_id && value.epoch > 0 => {
                             let encoded = serde_json::to_vec(&value).unwrap();
-                            store.update(WRITER_KEY, encoded.into(), entry.revision).await.ok().map(|_| value.epoch)
+                            (store.update(WRITER_KEY, encoded.into(), entry.revision).await.ok().map(|_| value.epoch), false)
                         }
-                        _ => None,
+                        _ => (None, true),
                     },
                     Ok(None) => {
                         let provisional = serde_json::to_vec(&LeaseValue { instance_id: instance_id.clone(), epoch: 0 }).unwrap();
@@ -233,18 +241,23 @@ impl ReplicatedLog {
                                 let value = LeaseValue { instance_id: instance_id.clone(), epoch: revision };
                                 let encoded = serde_json::to_vec(&value).unwrap();
                                 match store.update(WRITER_KEY, encoded.into(), revision).await {
-                                    Ok(_) if log.append_fence(revision, &instance_id).await.is_ok() => Some(revision),
-                                    _ => None,
+                                    Ok(_) if log.append_fence(revision, &instance_id).await.is_ok() => (Some(revision), false),
+                                    _ => (None, true),
                                 }
                             }
-                            Err(_) => None,
+                            Err(_) => (None, true),
                         }
                     }
-                    _ => None,
+                    Err(_) => (None, false),
                 };
                 let mut current = state.write().await;
-                current.owned = renewed.is_some();
-                if let Some(epoch) = renewed { current.epoch = epoch; current.valid_until = Instant::now() + Duration::from_secs(4); }
+                if let Some(epoch) = renewed {
+                    current.owned = true;
+                    current.epoch = epoch;
+                    current.valid_until = Instant::now() + Duration::from_secs(4);
+                } else if definitely_lost || Instant::now() >= current.valid_until {
+                    current.owned = false;
+                }
                 drop(current);
                 sleep(Duration::from_millis(750)).await;
             }

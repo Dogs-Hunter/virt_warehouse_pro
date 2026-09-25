@@ -37,3 +37,46 @@ impl<'a> Reader<'a>{
  fn operation(&mut self)->Result<Operation>{Ok(Operation{operation_id:self.string()?,owner_id:self.string()?,sku:self.string()?,delta:self.i64()?,event_version:self.u64()?})}
  fn done(&self)->Result<()>{anyhow::ensure!(self.cursor==self.data.len(),"binary payload has trailing bytes");Ok(())}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn operation(id: &str) -> Operation {
+        Operation { operation_id: id.into(), owner_id: "owner".into(), sku: "sku".into(), delta: 17, event_version: 1 }
+    }
+
+    #[test]
+    fn operation_and_batch_round_trip() {
+        let first = operation("op-1");
+        assert_eq!(decode_operation(&encode_operation(&first).unwrap()).unwrap(), first);
+        let values = vec![operation("op-1"), operation("op-2")];
+        assert_eq!(decode_batch(&encode_batch(&values).unwrap()).unwrap(), values);
+    }
+
+    #[test]
+    fn rejects_truncation_and_trailing_bytes() {
+        let mut encoded = encode_operation(&operation("op-1")).unwrap();
+        assert!(decode_operation(&encoded[..encoded.len() - 1]).is_err());
+        encoded.push(0);
+        assert!(decode_operation(&encoded).is_err());
+    }
+
+    #[test]
+    fn replicated_records_round_trip() {
+        match decode_log(&encode_log_operations(7, &[operation("op-1")]).unwrap()).unwrap() {
+            BinaryLogRecord::Operations { epoch, operations } => {
+                assert_eq!(epoch, 7);
+                assert_eq!(operations, vec![operation("op-1")]);
+            }
+            _ => panic!("unexpected log record"),
+        }
+        match decode_log(&encode_log_fence(8, "writer-1").unwrap()).unwrap() {
+            BinaryLogRecord::Fence { epoch, owner } => {
+                assert_eq!(epoch, 8);
+                assert_eq!(owner, "writer-1");
+            }
+            _ => panic!("unexpected log record"),
+        }
+    }
+}

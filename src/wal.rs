@@ -35,7 +35,10 @@ impl Wal {
         let (recovered, valid_len) = recover(path).await?;
         let file = OpenOptions::new().create(true).append(true).open(path).await?;
         file.set_len(valid_len).await?;
-        let (sender, receiver) = mpsc::channel(max_batch.saturating_mul(4));
+        // max_batch counts WAL records, not requests. Keep queue memory bounded
+        // when large record groups are enabled for concurrent HTTP batches.
+        let queue_capacity = max_batch.clamp(64, 4096);
+        let (sender, receiver) = mpsc::channel(queue_capacity);
         tokio::spawn(writer(file, receiver, max_batch, flush_interval));
         Ok((Self { sender }, recovered))
     }
@@ -156,4 +159,52 @@ async fn recover(path: &Path) -> Result<(Vec<Operation>, u64)> {
         cursor = record_end;
     }
     Ok((operations, cursor as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("warehouse-{name}-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()))
+    }
+
+    fn operation(id: &str) -> Operation {
+        Operation { operation_id: id.into(), owner_id: "owner".into(), sku: "sku".into(), delta: 3, event_version: 1 }
+    }
+
+    fn record(operation: &Operation) -> Vec<u8> {
+        let payload = binary::encode_operation(operation).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn recovery_ignores_only_an_incomplete_tail() {
+        let file = path("wal-tail");
+        let complete = record(&operation("op-1"));
+        let second = record(&operation("op-2"));
+        let mut bytes = complete.clone();
+        bytes.extend_from_slice(&second[..second.len() / 2]);
+        tokio::fs::write(&file, bytes).await.unwrap();
+        let (recovered, valid_len) = recover(&file).await.unwrap();
+        assert_eq!(recovered, vec![operation("op-1")]);
+        assert_eq!(valid_len, complete.len() as u64);
+        let _ = tokio::fs::remove_file(file).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_checksum_corruption() {
+        let file = path("wal-corrupt");
+        let mut bytes = record(&operation("op-1"));
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        tokio::fs::write(&file, bytes).await.unwrap();
+        assert!(recover(&file).await.is_err());
+        let _ = tokio::fs::remove_file(file).await;
+    }
 }

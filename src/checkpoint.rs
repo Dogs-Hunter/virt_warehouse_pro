@@ -51,3 +51,36 @@ impl Checkpoint {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("warehouse-{name}-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))
+    }
+
+    #[tokio::test]
+    async fn checkpoint_is_monotonic_and_survives_reopen() {
+        let file = path("checkpoint");
+        let checkpoint = Checkpoint::open(&file).await.unwrap();
+        checkpoint.advance(9, 3).await.unwrap();
+        checkpoint.advance(4, 1).await.unwrap();
+        drop(checkpoint);
+        let reopened = Checkpoint::open(&file).await.unwrap();
+        assert_eq!(reopened.current().await, 9);
+        assert_eq!(reopened.writer_epoch().await, 3);
+        reopened.reset().await.unwrap();
+        assert_eq!(reopened.current().await, 0);
+        let _ = tokio::fs::remove_file(file).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_corrupt_checkpoint() {
+        let file = path("checkpoint-corrupt");
+        tokio::fs::write(&file, b"WCP1-short").await.unwrap();
+        assert!(Checkpoint::open(&file).await.is_err());
+        let _ = tokio::fs::remove_file(file).await;
+    }
+}

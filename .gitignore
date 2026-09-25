@@ -16,6 +16,9 @@ target/
 .idea/
 .vscode/
 
+# Rendered document QA previews
+docs/.qa-*/
+
 # OS artifacts
 Thumbs.db
 .DS_Store

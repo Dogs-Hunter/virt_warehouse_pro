@@ -163,3 +163,45 @@ pub async fn quarantine(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("cannot quarantine damaged snapshot as {}", quarantined.display()))?;
     Ok(quarantined)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("warehouse-{name}-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()))
+    }
+
+    #[tokio::test]
+    async fn snapshot_round_trip_preserves_state() {
+        let file = path("snapshot");
+        let value = SnapshotData {
+            version: 3,
+            sequence: 42,
+            balances: vec![BalanceSnapshot { owner_id: "owner".into(), sku: "sku".into(), balance: 77 }],
+            dedup: vec![DedupSnapshot { operation_id: "op-1".into(), fingerprint: [5; 32] }],
+            writer_epoch: 8,
+        };
+        save(&file, &value).await.unwrap();
+        let loaded = load(&file).await.unwrap().unwrap();
+        assert_eq!(loaded.sequence, 42);
+        assert_eq!(loaded.writer_epoch, 8);
+        assert_eq!(loaded.balances[0].balance, 77);
+        assert_eq!(loaded.dedup[0].fingerprint, [5; 32]);
+        let _ = tokio::fs::remove_file(file).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_checksum_detects_corruption() {
+        let file = path("snapshot-corrupt");
+        let value = SnapshotData { version: 3, sequence: 1, balances: Vec::new(), dedup: Vec::new(), writer_epoch: 1 };
+        save(&file, &value).await.unwrap();
+        let mut bytes = tokio::fs::read(&file).await.unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        tokio::fs::write(&file, bytes).await.unwrap();
+        assert!(load(&file).await.is_err());
+        let _ = tokio::fs::remove_file(file).await;
+    }
+}
